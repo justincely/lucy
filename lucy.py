@@ -5,7 +5,10 @@ import numpy as np
 import scipy
 from scipy import stats
 from scipy.ndimage.filters import convolve
-from astropy.io import fits
+try:
+    from astropy.io import fits
+except ImportError:
+    import pyfits as fits
 
 import matplotlib.pyplot as plt
 
@@ -19,15 +22,67 @@ def pad_psf(psf, spectrum):
 
     return out_psf
 
+def rl_fft(raw_image, psf, niter, k=1, con_var=None):
+    """ Implementing the one i got from Jerry
+
+    """
+
+    calc_chisq = lambda a, b, c, d: np.sum((a - b)**2 / (a + c)**2 / (d-1))
+    
+    conversion =  raw_image.mean() / 10
+    raw_image /= conversion
+    
+    lucy = np.ones(raw_image.shape)
+    ratio = k * np.ones(raw_image.shape)
+    fft_psf = np.fft.fft(psf)
+    
+    con_var = sample_noise(raw_image)
+    print "using: ", con_var
+
+    norm = np.fft.ifft(np.fft.fft(ratio) * np.conj(fft_psf))
+    #index = np.where(norm <= 1E-3 * norm.max())
+    #norm[index] = 1
+    #raw_image[index] = 0
+
+    fft_conv = fft_psf * np.fft.fft(lucy)
+    lucy_conv = np.fft.ifft(fft_conv)
+
+    chisq = calc_chisq(lucy_conv, raw_image, con_var, raw_image.size)
+    print "initial Chisq: {}".format(chisq)
+
+    #plt.figure()
+    #plt.plot(raw_image)
+
+    for iteration in range(niter):
+        ratio = k * (raw_image + con_var) / (lucy_conv + con_var)
+        fft_srat = np.fft.fft(ratio) * np.conj(fft_psf)
+
+        lucy *= np.fft.ifft(fft_srat) / norm
+        print lucy.max(), lucy.mean(), lucy.min()
+        fft_conv = fft_psf * np.fft.fft(lucy)
+        lucy_conv = np.fft.ifft(fft_conv)
+        size = lucy.size
+        #plt.plot(lucy[range(size/2,size)+range(0,size/2)])
+        chisq = calc_chisq(lucy_conv, raw_image, con_var, raw_image.size)
+        print "Iteration {} Chisq: {}".format(iteration, chisq)
+
+    #pdb.set_trace()
+    #raw_input('done')
+
+    #--Why?!
+    lucy = lucy[range(size/2,size)+range(0,size/2)]
+    return lucy * conversion
+
 def rl_standard(raw_image, psf, niter):
     """ Standerd lucy-richardson convolution
 
     arXiv 2002 Lauer
 
     """
-
+   
+    psf /= psf.sum()
     psf_inverse = psf[::-1]
-    lucy = np.ones( raw_image.shape )
+    lucy = np.ones( raw_image.shape ) * raw_image.mean()
 
     for i in xrange( niter ):
         estimate = convolve(lucy, psf, mode='mirror')
@@ -47,12 +102,15 @@ def rl_standard(raw_image, psf, niter):
 def sample_noise( spectrum ):
     samples = [spectrum[start:start+300].std() for start in range(0, len(spectrum), 300) ]
 
-    return np.mean( samples )
+    return np.median( samples )
 
-def rl_damped(raw, psf, niter=2, damped=True):
+def rl_damped(raw, psf, niter=2, damped=True, N=3, T=None, multiplier=1):
     """ working on it"""
 
-    psf /= psf.sum()
+    #psf /= psf.sum()
+
+    conversion = raw.mean() / 10
+    raw /= conversion
     lucy = np.ones(raw.shape) * raw.mean()
 
     #plt.ion()
@@ -63,7 +121,7 @@ def rl_damped(raw, psf, niter=2, damped=True):
         if damped:
             print "dampening"
             lucy_temp = convolve( lucy, psf, mode='mirror')
-            ratio = dampen(lucy_temp, raw)
+            ratio = dampen(lucy_temp, raw, N, T, multiplier)
         else:
             ratio = raw / convolve(lucy, psf, mode='mirror')
 
@@ -74,20 +132,20 @@ def rl_damped(raw, psf, niter=2, damped=True):
 
         lucy = lucy * (top / psf.sum())
         #plt.plot( lucy )
-        print 'iteration', i, lucy.mean()
+        print 'iteration', i, lucy.mean(), raw.mean()
         print
 
     #raw_input('Done')
-    return lucy
+    return lucy * conversion
 
-def u_factor(lucy, raw_image, T=None):
+def u_factor(lucy, raw_image, T=None, multiplier=1):
     """ Equation 7 
     http://spider.ipac.caltech.edu/staff/fmasci/home/astro_refs/DampledLR94.pdf 
 
     """
     assert np.all( lucy > 0 ), 'Negative values'
 
-    T = T or 3 * sample_noise(raw_image)
+    T = T or multiplier * sample_noise(raw_image)
     print 'Using {} for T'.format(T)
 
     first = (-2.0 / T**2)
@@ -108,13 +166,13 @@ def u_factor(lucy, raw_image, T=None):
     print 'Factor=',np.median([factor>0]), factor[factor>0].min()
     return factor
 
-def dampen(lucy, raw, N=3):
+def dampen(lucy, raw, N=3, T=None, multiplier=1):
 
-    first = u_factor(lucy, raw)**(N-1)
+    first = u_factor(lucy, raw, T, multiplier)**(N-1)
     first[ np.isnan(first) ] = 0
     print first.mean()
 
-    second = (N - (N-1) * u_factor(lucy, raw))
+    second = (N - (N-1) * u_factor(lucy, raw, T, multiplier))
     second[ np.isnan(second) ] = 0
     print second.mean()
 
